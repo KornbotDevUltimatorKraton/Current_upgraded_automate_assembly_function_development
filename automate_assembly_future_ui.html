@@ -986,6 +986,13 @@
       cursor: pointer;
     }
 
+    .context-menu button.active {
+      background: #00eaff !important;
+      color: black !important;
+      border-color: #00eaff !important;
+      box-shadow: 0 0 8px rgba(0, 234, 255, 0.6);
+    }
+
     .axis-row {
       display: flex;
       align-items: center;
@@ -1069,6 +1076,12 @@
   <div class="blue-glow" id="globalGlow"></div>
   <div id="three-container"></div>
   <div id="contextMenu" class="context-menu">
+    <div class="section-title">Transform Mode</div>
+    <div class="mode-toggle-row" style="display: flex; gap: 6px; margin-bottom: 10px;">
+      <button id="btnTranslate" style="flex: 1; margin-top: 0; padding: 4px; font-size: 11px;">Translate</button>
+      <button id="btnRotate" style="flex: 1; margin-top: 0; padding: 4px; font-size: 11px;">Rotate</button>
+    </div>
+
     <div class="section-title">Position</div>
     <div class="axis-row">
       <span class="axis x">X</span><input id="px">
@@ -2256,8 +2269,14 @@
       //split_presemantic_detect(text);
       // If final result, confirm it in console
 
+      // Show transcript in the text input in real time
+      chatInput.value = text;
+
       if (event.results[0].isFinal) {
         console.log("✅ Final result:", text);
+
+        // Clear the text input when final transcript is sent to chat
+        chatInput.value = '';
 
         // Append voice text to chat UI
         appendMessage(text, 'user-msg');
@@ -4800,6 +4819,8 @@
     const ry = document.getElementById('ry');
     const rz = document.getElementById('rz');
     const applyTransform = document.getElementById('applyTransform');
+    const btnTranslate = document.getElementById('btnTranslate');
+    const btnRotate = document.getElementById('btnRotate');
 
     /* =======================
        INIT
@@ -4836,7 +4857,7 @@
       targetCameraPos.copy(camera.position);
       targetOrbitPos.copy(orbit.target);
 
-      // Smooth zoom to mouse cursor
+      // Smooth zoom to mouse cursor (CAD-style, Onshape-matching)
       mainRenderer.domElement.addEventListener('wheel', (event) => {
         event.preventDefault();
 
@@ -4847,12 +4868,13 @@
         raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
 
         let M = new THREE.Vector3();
-        const intersects = raycaster.intersectObjects(scene.children, true);
-
-        // Find valid intersection (ignore GridHelper, lights, etc if possible, but scene.children is okay for CAD models)
         let hit = false;
+
+        // 1. Try to hit a real mesh first
+        const intersects = raycaster.intersectObjects(scene.children, true);
         for (let i = 0; i < intersects.length; i++) {
-          if (intersects[i].object.type === "Mesh" || intersects[i].object.type === "Points") {
+          const obj = intersects[i].object;
+          if (obj.type === 'Mesh' || obj.type === 'Points') {
             M.copy(intersects[i].point);
             hit = true;
             break;
@@ -4860,13 +4882,30 @@
         }
 
         if (!hit) {
-          // Fallback: point on a plane at orbit.target distance
-          const distance = camera.position.distanceTo(orbit.target);
-          M.copy(camera.position).add(raycaster.ray.direction.multiplyScalar(distance));
+          // 2. Fallback: project ray onto the plane that passes through
+          //    orbit.target and faces the camera. This ensures the pivot
+          //    stays near the scene center even when cursor is off-model.
+          const camToTarget = new THREE.Vector3().subVectors(orbit.target, camera.position);
+          const depth = camToTarget.dot(raycaster.ray.direction);
+          if (depth > 0) {
+            M.copy(camera.position).addScaledVector(raycaster.ray.direction, depth);
+          } else {
+            M.copy(orbit.target); // Last resort: use orbit target directly
+          }
         }
 
-        // CAD style zoom factors
-        const zoomFactor = event.deltaY < 0 ? 0.8 : 1.25;
+        // 3. Adaptive zoom speed: scale factor depends on distance to pivot
+        //    so far-away models zoom at usable speed, close models stay precise.
+        const distToPivot = camera.position.distanceTo(M);
+        const adaptiveSensitivity = Math.max(0.0005, Math.min(0.002, distToPivot * 0.0003));
+        let zoomFactor = Math.exp(event.deltaY * adaptiveSensitivity);
+
+        // 4. Clamp: prevent camera from crossing through pivot (stops zoom-past glitch)
+        const newDist = targetCameraPos.distanceTo(M) * zoomFactor;
+        const MIN_DIST = 0.05;
+        if (newDist < MIN_DIST) {
+          zoomFactor = MIN_DIST / targetCameraPos.distanceTo(M);
+        }
 
         targetCameraPos.sub(M).multiplyScalar(zoomFactor).add(M);
         targetOrbitPos.sub(M).multiplyScalar(zoomFactor).add(M);
@@ -5612,6 +5651,51 @@
     }
 
     /* =======================
+       TRANSFORM MODE TOGGLE
+    ======================= */
+    function updateTransformModeButtons() {
+      if (!transformControl) return;
+      if (transformControl.mode === 'translate') {
+        btnTranslate.classList.add('active');
+        btnRotate.classList.remove('active');
+      } else if (transformControl.mode === 'rotate') {
+        btnTranslate.classList.remove('active');
+        btnRotate.classList.add('active');
+      }
+    }
+
+    btnTranslate.onclick = () => {
+      if (transformControl) {
+        transformControl.setMode('translate');
+        updateTransformModeButtons();
+      }
+    };
+
+    btnRotate.onclick = () => {
+      if (transformControl) {
+        transformControl.setMode('rotate');
+        updateTransformModeButtons();
+      }
+    };
+
+    function updateModelFromInputs() {
+      if (!selectedModel) return;
+      selectedModel.position.set(+px.value, +py.value, +pz.value);
+      selectedModel.rotation.set(
+        THREE.MathUtils.degToRad(+rx.value),
+        THREE.MathUtils.degToRad(+ry.value),
+        THREE.MathUtils.degToRad(+rz.value)
+      );
+      if (transformControl && transformControl.object === selectedModel) {
+        transformControl.updateMatrixWorld();
+      }
+    }
+
+    [px, py, pz, rx, ry, rz].forEach(input => {
+      input.addEventListener('input', updateModelFromInputs);
+    });
+
+    /* =======================
        CONTEXT MENU
     ======================= */
     function openContextMenu(x, y, model) {
@@ -5623,6 +5707,8 @@
       rx.value = THREE.MathUtils.radToDeg(model.rotation.x).toFixed(1);
       ry.value = THREE.MathUtils.radToDeg(model.rotation.y).toFixed(1);
       rz.value = THREE.MathUtils.radToDeg(model.rotation.z).toFixed(1);
+
+      updateTransformModeButtons();
 
       contextMenu.style.display = 'block';
 
@@ -5728,8 +5814,14 @@
     ======================= */
     function onKeyTransformMode(e) {
       if (!transformControl || !transformControl.object) return;
-      if (e.key === 't') transformControl.setMode('translate');
-      if (e.key === 'r') transformControl.setMode('rotate');
+      if (e.key === 't') {
+        transformControl.setMode('translate');
+        updateTransformModeButtons();
+      }
+      if (e.key === 'r') {
+        transformControl.setMode('rotate');
+        updateTransformModeButtons();
+      }
     }
 
     /* =======================
